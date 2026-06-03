@@ -54,7 +54,7 @@
 # Usage:
 #   ./build-dtb-image.sh \
 #       (--kernel-deb <path/to/kernel.deb> | --dtb-src <path/to/dtb/dir>) \
-#       [--size <MB>] [--out <file>]
+#       [--size <MB>] [--out <file>] [--sector-size <bytes>]
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # Arguments:
@@ -78,6 +78,12 @@
 #
 #   --out / -out
 #              Output image filename (default: dtb.bin)
+#
+#   --sector-size / -sector-size
+#              FAT sector size in bytes (default: 4096).
+#              Must be a power of 2 in the range [512, 32768].
+#              Common values: 512, 1024, 2048, 4096.
+#              Passed to mformat as -S sizecode where sizecode = log2(bytes) - 7.
 #
 # Requirements / Assumptions:
 #   - Linux host with:
@@ -110,6 +116,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DTB_BIN_SIZE=4         # Default FAT image size (MB)
 DTB_BIN="dtb.bin"      # Default output image filename
 PRUNE=0                # Prune ITS entries whose DTB/DTBO is absent from source
+FAT_SECTOR_SIZE=4096   # Default FAT sector size in bytes
 
 DTB_SRC=""             # DTB source directory (resolved; required via one mode)
 
@@ -125,7 +132,7 @@ DEFAULT_ITS_FILE="qcom-next-fitimage.its"
 
 usage() {
     cat <<EOF
-Usage: $0 (--kernel-deb <kernel.deb> | --dtb-src <path>) [--size <MB>] [--out <file>]
+Usage: $0 (--kernel-deb <kernel.deb> | --dtb-src <path>) [--size <MB>] [--out <file>] [--sector-size <bytes>]
 
   --kernel-deb, -kernel-deb  Path to Debian kernel package (.deb). DTBs located by probing:
                              1. <extract>/usr/lib/linux-image-*/        (Debian standard)
@@ -146,6 +153,11 @@ Usage: $0 (--kernel-deb <kernel.deb> | --dtb-src <path>) [--size <MB>] [--out <f
   --prune,     -prune        Prune ITS entries of dtb(o) based on kernel provided.
                              dtb.bin is created from reduced its file. there is
                              risk of missing dtb(o) due to kernel and finding it out during boot.
+
+  --sector-size, -sector-size
+                             FAT sector size in bytes (default: 4096).
+                             Must be a power of 2 in the range [512, 32768].
+                             Common values: 512, 1024, 2048, 4096.
 
 Notes:
   - Exactly one of --kernel-deb or --dtb-src must be provided.
@@ -207,6 +219,10 @@ while [[ $# -gt 0 ]]; do
             PRUNE=1
             shift 1
             ;;
+        -sector-size|--sector-size)
+            FAT_SECTOR_SIZE="${2:-}"
+            shift 2
+            ;;
         -h|--help)
             usage
             ;;
@@ -233,6 +249,27 @@ if ! [[ "${DTB_BIN_SIZE}" =~ ^[0-9]+$ ]] || (( DTB_BIN_SIZE <= 0 )); then
     echo "[ERROR] --size must be a positive integer (MB), got '${DTB_BIN_SIZE}'." >&2
     exit 1
 fi
+
+# Validate --sector-size: must be a positive integer, a power of 2, in [512, 32768].
+# Compute mformat sizecode = log2(FAT_SECTOR_SIZE) - 7 using pure bash arithmetic
+# (no bc, no python3, no awk — zero external tools).
+if ! [[ "${FAT_SECTOR_SIZE}" =~ ^[0-9]+$ ]] || (( FAT_SECTOR_SIZE <= 0 )); then
+    echo "[ERROR] --sector-size must be a positive integer (bytes), got '${FAT_SECTOR_SIZE}'." >&2
+    exit 1
+fi
+if (( FAT_SECTOR_SIZE < 512 || FAT_SECTOR_SIZE > 32768 )); then
+    echo "[ERROR] --sector-size must be in the range [512, 32768], got '${FAT_SECTOR_SIZE}'." >&2
+    exit 1
+fi
+if (( (FAT_SECTOR_SIZE & (FAT_SECTOR_SIZE - 1)) != 0 )); then
+    echo "[ERROR] --sector-size must be a power of 2, got '${FAT_SECTOR_SIZE}'." >&2
+    exit 1
+fi
+# log2 via right-shift loop — exact for any power of 2, pure bash, no subshell
+_log2=0; _v=${FAT_SECTOR_SIZE}
+while (( _v > 1 )); do (( _v >>= 1 )); (( _log2++ )); done
+FAT_SECTOR_SIZE_CODE=$(( _log2 - 7 ))
+unset _log2 _v
 
 # Validate that required metadata files are present in the repository
 if [[ ! -f "${SCRIPT_DIR}/qcom-metadata.dts" ]]; then
@@ -465,10 +502,10 @@ file "${FIT_STAGE}/out/qclinux_fit.img"
 echo "[INFO] Creating FAT image '${DTB_BIN}' (${DTB_BIN_SIZE} MB)..."
 dd if=/dev/zero of="${DTB_BIN}" bs=1M count="${DTB_BIN_SIZE}" status=progress
 
-echo "[INFO] Formatting '${DTB_BIN}' as FAT (4 KiB sector size)..."
-# -S 5: sector size code → 2^(5+7) = 4096 bytes (matches original mkfs.vfat -S 4096)
-# No -F: let mformat auto-select FAT type based on image size, matching mkfs.vfat behaviour
-mformat -i "${DTB_BIN}" -S 5 ::
+echo "[INFO] Formatting '${DTB_BIN}' as FAT ( byte sector size, sizecode )..."
+# -S sizecode: sector size = 2^(sizecode+7) bytes.  sizecode derived from --sector-size at runtime.
+# No -F: let mformat auto-select FAT type based on image size, matching mkfs.vfat behaviour.
+mformat -i "${DTB_BIN}" -S "${FAT_SECTOR_SIZE_CODE}" ::
 
 echo "[INFO] Copying qclinux_fit.img into FAT image..."
 mcopy -i "${DTB_BIN}" "${FIT_STAGE}/out/qclinux_fit.img" ::
